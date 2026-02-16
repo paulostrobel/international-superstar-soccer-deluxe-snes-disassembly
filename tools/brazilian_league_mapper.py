@@ -13,12 +13,21 @@ Usage:
     python3 brazilian_league_mapper.py [--season YEAR] [--output DIR]
     python3 brazilian_league_mapper.py --season 2024 --output ./output
     python3 brazilian_league_mapper.py --skip-extra-stats   # faster, less accurate
+    python3 brazilian_league_mapper.py --fetcher selenium    # force Selenium backend
+    python3 brazilian_league_mapper.py --html-dir ./pages    # use saved HTML files
 
 Data source: https://fbref.com/en/comps/24/Serie-A-Stats
 Rate limit: 1 request per 6 seconds (fbref.com policy)
 
 Requirements:
-    pip install requests beautifulsoup4 lxml
+    pip install beautifulsoup4 lxml cloudscraper
+
+    Optional (if cloudscraper is blocked by Cloudflare v3):
+        pip install undetected-chromedriver selenium
+        (also requires Chrome/Chromium browser installed)
+
+    Offline fallback:
+        Save fbref pages from your browser into a directory and use --html-dir
 """
 
 import requests
@@ -28,6 +37,8 @@ import sys
 import argparse
 import json
 import re
+import atexit
+import hashlib
 import logging
 from pathlib import Path
 
@@ -35,8 +46,25 @@ try:
     from bs4 import BeautifulSoup
 except ImportError:
     print("ERROR: beautifulsoup4 is required. Install with:")
-    print("  pip install beautifulsoup4 lxml requests")
+    print("  pip install beautifulsoup4 lxml cloudscraper")
     sys.exit(1)
+
+# Optional: cloudscraper (handles Cloudflare JS challenges)
+HAS_CLOUDSCRAPER = False
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    pass
+
+# Optional: Selenium + undetected-chromedriver (full browser fallback)
+HAS_SELENIUM = False
+try:
+    import undetected_chromedriver as uc
+    from selenium.webdriver.support.ui import WebDriverWait
+    HAS_SELENIUM = True
+except ImportError:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,11 +164,23 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Referer": "https://fbref.com/",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.google.com/",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
     "DNT": "1",
     "Connection": "keep-alive",
 }
@@ -148,12 +188,192 @@ HEADERS = {
 REQUEST_DELAY = 6  # fbref rate limit: 1 req / 6 seconds
 
 
-def fetch_page(url, retries=3):
-    """Fetch a page respecting fbref.com rate limits."""
+# ============================================================================
+# Multi-Backend Fetcher (cloudscraper → Selenium → requests)
+# ============================================================================
+
+# Active fetcher state (set by init_fetcher)
+_fetcher_type = None   # "cloudscraper" | "selenium" | "requests" | "offline"
+_fetcher_session = None  # the session/driver object
+_html_dir = None         # path for offline mode
+
+
+def init_fetcher(backend="auto", html_dir=None):
+    """
+    Initialize the HTTP fetcher backend.
+
+    Priority for "auto":  cloudscraper → selenium → requests
+    """
+    global _fetcher_type, _fetcher_session, _html_dir
+
+    # Offline mode overrides everything
+    if html_dir:
+        _html_dir = html_dir
+        _fetcher_type = "offline"
+        logger.info(f"Fetcher: OFFLINE mode (reading from {html_dir})")
+        return "offline"
+
+    if backend == "auto":
+        if HAS_CLOUDSCRAPER:
+            backend = "cloudscraper"
+        elif HAS_SELENIUM:
+            backend = "selenium"
+        else:
+            backend = "requests"
+
+    if backend == "cloudscraper":
+        if not HAS_CLOUDSCRAPER:
+            logger.error("cloudscraper not installed: pip install cloudscraper")
+            sys.exit(1)
+        _fetcher_session = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True},
+        )
+        _fetcher_session.headers.update(HEADERS)
+        _fetcher_type = "cloudscraper"
+        logger.info("Fetcher: cloudscraper (Cloudflare JS bypass)")
+
+    elif backend == "selenium":
+        if not HAS_SELENIUM:
+            logger.error(
+                "Selenium not installed: pip install undetected-chromedriver selenium"
+            )
+            sys.exit(1)
+        options = uc.ChromeOptions()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-gpu")
+        _fetcher_session = uc.Chrome(options=options)
+        _fetcher_type = "selenium"
+        atexit.register(_cleanup_selenium)
+        logger.info("Fetcher: Selenium + undetected-chromedriver (full browser)")
+
+    elif backend == "requests":
+        _fetcher_session = requests.Session()
+        _fetcher_session.headers.update(HEADERS)
+        _fetcher_type = "requests"
+        logger.info("Fetcher: plain requests (may get 403 from Cloudflare)")
+
+    else:
+        logger.error(f"Unknown fetcher backend: {backend}")
+        sys.exit(1)
+
+    return _fetcher_type
+
+
+def _cleanup_selenium():
+    """Shut down the Selenium browser on exit."""
+    global _fetcher_session
+    if _fetcher_type == "selenium" and _fetcher_session:
+        try:
+            _fetcher_session.quit()
+        except Exception:
+            pass
+        _fetcher_session = None
+
+
+def _url_to_filename(url):
+    """Convert a URL to a safe filename for offline mode."""
+    # Extract meaningful path parts
+    path = url.replace(FBREF_BASE_URL, "").strip("/")
+    # Sanitize for filesystem
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", path)
+    # Add a short hash to avoid collisions
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+    return f"{safe[:80]}_{url_hash}.html"
+
+
+def _load_offline(url):
+    """Load a page from the offline HTML directory."""
+    target = _url_to_filename(url)
+    target_path = os.path.join(_html_dir, target)
+
+    # Also try a simpler name match (user may have saved as "flamengo.html")
+    candidates = [target_path]
+    # Try matching any file that contains relevant URL fragments
+    if os.path.isdir(_html_dir):
+        url_parts = url.replace(FBREF_BASE_URL, "").strip("/").split("/")
+        for f in os.listdir(_html_dir):
+            if f.endswith(".html") or f.endswith(".htm"):
+                flow = f.lower()
+                for part in url_parts:
+                    if len(part) > 3 and part.lower() in flow:
+                        candidates.append(os.path.join(_html_dir, f))
+                        break
+
+    for path in candidates:
+        if os.path.isfile(path):
+            logger.info(f"OFFLINE: loading {path}")
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+
+    logger.warning(f"OFFLINE: no file found for {url}")
+    logger.warning(f"  Expected: {target_path}")
+    logger.warning(f"  Tip: open the URL in your browser, Ctrl+S to save as HTML,")
+    logger.warning(f"       then place it in {_html_dir}/")
+    return None
+
+
+def _fetch_with_cloudscraper(url, retries=3):
+    """Fetch using cloudscraper (handles Cloudflare JS challenges)."""
     for attempt in range(retries):
         try:
-            logger.info(f"GET {url}")
-            resp = requests.get(url, headers=HEADERS, timeout=30)
+            logger.info(f"GET [cloudscraper] {url}")
+            resp = _fetcher_session.get(url, timeout=30)
+            if resp.status_code == 200:
+                time.sleep(REQUEST_DELAY)
+                return resp.text
+            if resp.status_code == 429:
+                wait = 60 * (attempt + 1)
+                logger.warning(f"Rate limited (429). Waiting {wait}s...")
+                time.sleep(wait)
+            elif resp.status_code == 403:
+                logger.warning(
+                    f"HTTP 403 from cloudscraper (attempt {attempt + 1}/{retries})"
+                )
+                # Cloudflare may need a longer delay before retry
+                time.sleep(REQUEST_DELAY * 3)
+            else:
+                logger.warning(f"HTTP {resp.status_code} — retrying...")
+                time.sleep(REQUEST_DELAY * 2)
+        except Exception as exc:
+            logger.error(f"cloudscraper error: {exc}")
+            time.sleep(REQUEST_DELAY * 2)
+    return None
+
+
+def _fetch_with_selenium(url, retries=3):
+    """Fetch using Selenium headless browser."""
+    for attempt in range(retries):
+        try:
+            logger.info(f"GET [selenium] {url}")
+            _fetcher_session.get(url)
+            # Wait for page to fully load
+            time.sleep(3)
+            # Check for Cloudflare challenge page and wait extra if needed
+            page = _fetcher_session.page_source
+            if "Just a moment" in page or "Checking your browser" in page:
+                logger.info("  Cloudflare challenge detected, waiting...")
+                time.sleep(8)
+                page = _fetcher_session.page_source
+            if len(page) > 1000:  # sanity check
+                time.sleep(REQUEST_DELAY)
+                return page
+            logger.warning(f"  Page too small ({len(page)} bytes), retrying...")
+            time.sleep(REQUEST_DELAY * 2)
+        except Exception as exc:
+            logger.error(f"Selenium error: {exc}")
+            time.sleep(REQUEST_DELAY * 2)
+    return None
+
+
+def _fetch_with_requests(url, retries=3):
+    """Fetch using plain requests (likely to get 403 from Cloudflare)."""
+    for attempt in range(retries):
+        try:
+            logger.info(f"GET [requests] {url}")
+            resp = _fetcher_session.get(url, timeout=30)
             if resp.status_code == 200:
                 time.sleep(REQUEST_DELAY)
                 return resp.text
@@ -167,7 +387,52 @@ def fetch_page(url, retries=3):
         except requests.RequestException as exc:
             logger.error(f"Request error: {exc}")
             time.sleep(REQUEST_DELAY * 2)
-    logger.error(f"FAILED after {retries} attempts: {url}")
+    return None
+
+
+def fetch_page(url, retries=3):
+    """
+    Fetch a page using the active backend, respecting fbref.com rate limits.
+
+    If the primary backend returns 403/None and a fallback is available,
+    automatically escalates to the next backend.
+    """
+    global _fetcher_type, _fetcher_session
+
+    if _fetcher_type == "offline":
+        return _load_offline(url)
+
+    # Try the configured backend first
+    if _fetcher_type == "cloudscraper":
+        result = _fetch_with_cloudscraper(url, retries)
+        if result:
+            return result
+        # Auto-fallback to Selenium if available
+        if HAS_SELENIUM:
+            logger.warning("cloudscraper failed — falling back to Selenium...")
+            init_fetcher("selenium")
+            result = _fetch_with_selenium(url, retries)
+            if result:
+                return result
+
+    elif _fetcher_type == "selenium":
+        result = _fetch_with_selenium(url, retries)
+        if result:
+            return result
+
+    elif _fetcher_type == "requests":
+        result = _fetch_with_requests(url, retries)
+        if result:
+            return result
+        # Auto-fallback: try cloudscraper if available
+        if HAS_CLOUDSCRAPER:
+            logger.warning("requests failed — falling back to cloudscraper...")
+            init_fetcher("cloudscraper")
+            result = _fetch_with_cloudscraper(url, retries)
+            if result:
+                return result
+
+    logger.error(f"FAILED all backends for: {url}")
     return None
 
 
@@ -823,10 +1088,35 @@ def main():
         "--skip-extra-stats", action="store_true",
         help="Only fetch standard stats (faster, less accurate mapping)",
     )
+    parser.add_argument(
+        "--fetcher", type=str, default="auto",
+        choices=["auto", "cloudscraper", "selenium", "requests"],
+        help=(
+            "HTTP backend to use (default: auto). "
+            "'auto' tries cloudscraper -> selenium -> requests."
+        ),
+    )
+    parser.add_argument(
+        "--html-dir", type=str, default=None,
+        help=(
+            "Path to directory with saved HTML files from fbref.com "
+            "(offline mode — no network requests needed)"
+        ),
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
     os.makedirs(args.cache, exist_ok=True)
+
+    # ---- Initialize fetcher ----
+    active_backend = init_fetcher(args.fetcher, args.html_dir)
+
+    backends_available = []
+    if HAS_CLOUDSCRAPER:
+        backends_available.append("cloudscraper")
+    if HAS_SELENIUM:
+        backends_available.append("selenium")
+    backends_available.append("requests")
 
     banner = """
 ╔══════════════════════════════════════════════════════════════╗
@@ -834,9 +1124,21 @@ def main():
 ║  Source: https://fbref.com/en/comps/24/Serie-A-Stats        ║
 ╚══════════════════════════════════════════════════════════════╝"""
     print(banner)
-    print(f"  Season : {args.season or 'current'}")
-    print(f"  Output : {args.output}")
+    print(f"  Season  : {args.season or 'current'}")
+    print(f"  Output  : {args.output}")
+    print(f"  Fetcher : {active_backend}  (available: {', '.join(backends_available)})")
+    if args.html_dir:
+        print(f"  HTML dir: {args.html_dir}")
     print()
+
+    if active_backend == "requests" and not args.html_dir:
+        print("  WARNING: Using plain 'requests' — fbref.com will likely block with 403.")
+        print("           Install cloudscraper for best results:")
+        print("             pip install cloudscraper")
+        print("           Or use Selenium:")
+        print("             pip install undetected-chromedriver selenium")
+        print("           Or save pages manually and use --html-dir")
+        print()
 
     # ---- Step 1: Team list ----
     print("[1/4] Fetching team list...")
